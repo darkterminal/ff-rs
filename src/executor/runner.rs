@@ -1,7 +1,8 @@
-use std::process::Command;
+use crate::command_builder::builder::FfmpegCommand;
+use std::process::{Command, Stdio};
 
 /// Runner for executing ffmpeg commands.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Runner;
 
 /// Error types that can occur during command execution.
@@ -31,61 +32,51 @@ impl Runner {
     }
 
     /// Executes the given ffmpeg command.
-    ///
-    /// # Arguments
-    ///
-    /// * `cmd` - The ffmpeg command to execute
-    ///
-    /// # Returns
-    ///
-    /// A `Result` indicating success or an `ExecutionError`.
-    pub fn execute(&self, cmd: &str) -> Result<(), ExecutionError> {
+    /// Streams stdout/stderr directly from ffmpeg (constitution requirement).
+    pub fn execute(&self, cmd: &FfmpegCommand) -> Result<(), ExecutionError> {
         self.check_ffmpeg_availability()?;
 
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-
-        if parts.is_empty() {
-            return Err(ExecutionError::InvalidCommand("Command is empty".to_string()));
+        if cmd.args.is_empty() {
+            return Err(ExecutionError::InvalidCommand(
+                "Command has no arguments".to_string(),
+            ));
         }
 
-        let program = parts[0];
-        let args: Vec<&str> = parts[1..].to_vec();
+        let status = Command::new(&cmd.program)
+            .args(&cmd.args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|e| {
+                ExecutionError::CommandFailed(format!("Failed to execute command: {}", e))
+            })?;
 
-        let output = Command::new(program)
-            .args(&args)
-            .output()
-            .map_err(|e| ExecutionError::CommandFailed(format!("Failed to execute command: {}", e)))?;
-
-        if output.status.success() {
-            if !output.stdout.is_empty() {
-                println!("{}", String::from_utf8_lossy(&output.stdout));
-            }
+        if status.success() {
             Ok(())
         } else {
-            if !output.stderr.is_empty() {
-                eprintln!("{}", String::from_utf8_lossy(&output.stderr));
-            }
             Err(ExecutionError::CommandFailed(format!(
                 "Command exited with status: {}",
-                output.status
+                status
             )))
         }
     }
 
     /// Checks if ffmpeg is available in the system PATH.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` indicating success or an `ExecutionError` if ffmpeg is not available.
     fn check_ffmpeg_availability(&self) -> Result<(), ExecutionError> {
         match Command::new("ffmpeg")
             .arg("-version")
-            .output() {
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
             Ok(_) => Ok(()),
-            Err(_) => Err(ExecutionError::CommandFailed("ffmpeg is not available in PATH".to_string())),
+            Err(_) => Err(ExecutionError::CommandFailed(
+                "ffmpeg is not available in PATH".to_string(),
+            )),
         }
     }
-
 }
 
 #[cfg(test)]

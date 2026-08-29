@@ -1,15 +1,17 @@
 use clap::Parser as ClapParser;
 use std::io::{self, Write};
 
+mod command_builder;
+mod errors;
+mod executor;
 mod grammar;
 mod intent;
-mod command_builder;
-mod executor;
 mod utils;
 
-use grammar::{Tokenizer, Parser as GrammarParser};
 use command_builder::CommandBuilder;
+use errors::FfError;
 use executor::runner::Runner;
+use grammar::{Parser as GrammarParser, Tokenizer};
 
 #[derive(ClapParser)]
 #[command(name = "ff")]
@@ -32,7 +34,7 @@ fn main() {
     let args = Cli::parse();
 
     if args.interactive {
-        run_interactive_mode(args.dry_run);
+        run_interactive_mode(args.dry_run, args.output); // ← pass output
     } else if let Some(command) = args.command {
         run_direct_mode(&command, args.dry_run, args.output);
     } else {
@@ -41,27 +43,30 @@ fn main() {
     }
 }
 
-fn run_interactive_mode(dry_run: bool) {
+fn run_interactive_mode(dry_run: bool, output: Option<String>) {
+    // ← terima output
     println!("FF - Media Conversion Tool (Interactive Mode)");
     println!("Enter 'quit' or 'exit' to exit the program");
 
     loop {
         print!("> ");
-        io::stdout().flush().unwrap(); // Ensure the prompt is displayed immediately
+        io::stdout().flush().unwrap();
 
         let mut input = String::new();
         match io::stdin().read_line(&mut input) {
             Ok(_) => {
                 let input = input.trim();
-
                 if input.eq_ignore_ascii_case("quit") || input.eq_ignore_ascii_case("exit") {
                     break;
                 }
-
                 if !input.is_empty() {
-                    match process_command(input, dry_run, None) {
-                        Ok(_) => {},
-                        Err(e) => eprintln!("Error: {}", e),
+                    // clone() karena process_command consume Option<String>
+                    match process_command(input, dry_run, output.clone()) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            print_guidance(&e);
+                        }
                     }
                 }
             }
@@ -75,67 +80,94 @@ fn run_interactive_mode(dry_run: bool) {
 
 fn run_direct_mode(command: &str, dry_run: bool, output: Option<String>) {
     match process_command(command, dry_run, output) {
-        Ok(_) => std::process::exit(0), // Success
+        Ok(_) => std::process::exit(0),
         Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1); // User input error
+            eprintln!("{}", e);
+            print_guidance(&e);
+            std::process::exit(e.exit_code());
         }
     }
 }
 
-fn process_command(command: &str, dry_run: bool, output: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+fn print_guidance(err: &FfError) {
+    match err {
+        FfError::UserInput(msg) => {
+            if msg.contains("not exist") || msg.contains("not found") {
+                eprintln!(
+                    "Guidance: Make sure the input file path is correct and the file exists."
+                );
+            } else if msg.contains("Unsupported format") {
+                eprintln!("Guidance: Check supported formats: MP4, AVI, MOV, WMV, MKV, WebM, MP3, WAV, FLAC, JPG, PNG, GIF");
+            } else {
+                eprintln!("Guidance: Make sure your command follows the format 'convert <input> to <output>' or similar.");
+                eprintln!("Example: 'convert video.mp4 to video.avi'");
+            }
+        }
+        FfError::ExecutionFailure(msg) => {
+            if msg.contains("not available") {
+                eprintln!("Guidance: Install ffmpeg and ensure it is accessible in your PATH.");
+            } else {
+                eprintln!("Guidance: Check ffmpeg output above for details. Input file may be corrupted or format may be invalid.");
+            }
+        }
+        FfError::Internal(_) => {
+            eprintln!("Guidance: This is an unexpected bug. Please report it at https://github.com/darkterminal/ffrs/issues");
+        }
+    }
+}
+
+fn process_command(command: &str, dry_run: bool, output: Option<String>) -> Result<(), FfError> {
+    // Step 1: Tokenize & Parse
     let mut tokenizer = Tokenizer::new(command);
     let tokens = tokenizer.tokenize();
 
     let mut parser = GrammarParser::new(tokens);
-    let intent = match parser.parse() {
-        Ok(intent) => intent,
-        Err(e) => {
-            eprintln!("Parse Error: {}", e);
-            eprintln!("Guidance: Make sure your command follows the format 'convert <input> to <output>' or similar.");
-            eprintln!("Example: 'convert video.mp4 to video.avi'");
-            return Err(Box::new(e));
-        }
-    };
+    let intent = parser
+        .parse()
+        .map_err(|e| FfError::UserInput(e.to_string()))?;
 
+    // Step 2: Fail Fast — Validate input file exists
+    if !intent.input_path.exists() {
+        return Err(FfError::UserInput(format!(
+            "Input file does not exist: {}",
+            intent.input_path.display()
+        )));
+    }
+    if !intent.input_path.is_file() {
+        return Err(FfError::UserInput(format!(
+            "Input path is not a file: {}",
+            intent.input_path.display()
+        )));
+    }
+
+    // Step 3: Build ffmpeg command
     let cmd_builder = CommandBuilder::new();
-    let ffmpeg_cmd = match cmd_builder.build_command(&intent) {
-        Ok(cmd) => cmd,
-        Err(e) => {
-            eprintln!("Command Build Error: {}", e);
-            eprintln!("Guidance: Check that your input and output paths are valid and formats are supported.");
-            return Err(e);
-        }
-    };
 
-    let final_cmd = if let Some(output_dir) = output {
-        let output_path = std::path::PathBuf::from(&output_dir)
-            .join(intent.output_path.file_name().ok_or("Invalid output path")?);
-
-        match cmd_builder.build_command_with_output_path(&intent, output_path) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                eprintln!("Command Build Error: {}", e);
-                eprintln!("Guidance: Check that your output directory is valid and writable.");
-                return Err(e);
-            }
-        }
+    let ffmpeg_cmd = if let Some(output_dir) = output {
+        let output_path = std::path::PathBuf::from(&output_dir).join(
+            intent
+                .output_path
+                .file_name()
+                .ok_or_else(|| FfError::UserInput("Invalid output path".to_string()))?,
+        );
+        cmd_builder
+            .build_command_with_output_path(&intent, output_path)
+            .map_err(|e| FfError::UserInput(e.to_string()))?
     } else {
-        ffmpeg_cmd
+        cmd_builder
+            .build_command(&intent)
+            .map_err(|e| FfError::UserInput(e.to_string()))?
     };
 
-    println!("{}", final_cmd);
+    // Step 4: Print the command (constitution requirement)
+    println!("{}", ffmpeg_cmd.to_display_string());
 
+    // Step 5: Execute (unless dry-run)
     if !dry_run {
         let runner = Runner::new();
-        match runner.execute(&final_cmd) {
-            Ok(_) => {},
-            Err(e) => {
-                eprintln!("Execution Error: {}", e);
-                eprintln!("Guidance: Make sure ffmpeg is installed and accessible in your PATH.");
-                return Err(Box::new(e));
-            }
-        }
+        runner
+            .execute(&ffmpeg_cmd)
+            .map_err(|e| FfError::ExecutionFailure(e.to_string()))?;
     }
 
     Ok(())

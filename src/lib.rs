@@ -11,14 +11,16 @@
 //! - Dry-run functionality
 //! - Deterministic and inspectable command generation
 
+pub mod command_builder;
+pub mod errors;
+pub mod executor;
 pub mod grammar;
 pub mod intent;
-pub mod command_builder;
-pub mod executor;
 pub mod utils;
 
-pub use grammar::{Tokenizer, Parser};
-pub use intent::types::{Intent, OperationType};
-pub use command_builder::CommandBuilder;
+pub use command_builder::{CommandBuilder, FfmpegCommand};
+pub use errors::FfError;
 pub use executor::runner::Runner;
+pub use grammar::{Parser, Tokenizer};
+pub use intent::types::{Intent, OperationType};
 pub use utils::file_utils;
